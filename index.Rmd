@@ -1,0 +1,538 @@
+---
+title: "Predicting the 2016 Election Based on Demographic Data"
+author: "Tyler Chia, Michael La, Joanne Kim"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_collapsed: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F, 
+                      message = F,
+                      warning = F,
+                      fig.align = 'center',
+                      fig.height = 4, 
+                      fig.width = 4)
+
+# libraries here
+library(pander)
+library(tidyverse)
+library(maps)
+library(modelr)
+library(ROCR)
+library(randomForest)
+library(tree)
+library(gbm)
+library(ggridges)
+library(NbClust)
+```
+
+---
+
+# Introduction
+
+This project aimed to take a look at the 2016 election, mainly focusing on the effects of demographic variables on election results per county in the U.S. Election. However, forecasting is a difficult task due to the large number of factors that could influence individual decisions on any given day. Before beginning the project, we studied the founder of FiveThirtyEight, Nate Silver, and his election forecast model. Silver’s model mainly utilized polling data, which was successful in 2012, but not in the 2016 election. One reason why polling was not successful may be that many Trump voters were too shy to tell pollsters that they planned on voting for Trump, which led to inaccuracies in the statistical models that were used to predict the election outcome. Due to the error in these models, Donald Trump’s win in the election was unexpected in 2016.
+
+Since the election has already passed, our project aimed to forecast the election by working with census and election data rather than polling data. We explored various models to answer whether or not Donald Trump would win a county based on demographic variables such as unemployment, poverty, income per capita, and 19 others. With these models, we sought to perform both regression and classification methods. With respect to the regression method, we utilized a linear regression that served to predict the percentage of votes between the top two candidates that Donald Trump received by county. As for the classification methods, we used a logistic regression, random forest, and an adaptive boosting model to predict a class of “Yes” or “No”, referring to whether or not Trump won that specific county.  
+
+Our last goal was to identify patterns among counties sharing certain demographic characteristics and see if there was a way to interpret these patterns with the election results. Through K-Means clustering we were able to find a few distinct groupings, and examined whether or not these could help identify if counties with certain demographics would vote for Trump or not. 
+
+# Materials and Methods
+
+## Datasets
+
+With respect to the data that we used for this project, we used two sources of raw data: Tract-level 2010 census data and county-level vote tallies from the 2016 presidential election.  The 2010 census dataset contains census tract ID, state and county name, and various demographic variables such as the number of men and women. As for the election dataset, it contains the number of votes for each candidate with respect to each fips code. As a preprocessing method, we separated the election data into three separate dataframes. These three dataframes are federal-level tallies, state-level tallies, and county-level tallies. The county-level tallies is the dataframe that we are interested in as we seek to use demographic variables as a way to predict the winning candidate for each county. Below is an example of the first few rows of the county-level tallies data.
+
+```{r, include=FALSE}
+load('data/project_data.RData')
+
+filter(election_raw, !is.na(county)) %>% 
+  head() %>% 
+  pander()
+
+# filter out fips == 2000
+election_raw = election_raw %>% 
+  filter(fips != 2000)
+
+# create one dataframe per observational unit
+election_federal = election_raw %>% 
+  filter(fips == 'US')
+
+election_state = election_raw %>% 
+  filter(fips != 'US' & is.na(county))
+
+election = election_raw %>% 
+  filter(!is.na(county)) 
+election$fips = as.numeric(election$fips)
+```
+
+<center>
+**Table 1: County-Level Tallies of Election Data**
+
+The table below shows the first few rows of the election data specific to counties across the U.S.
+```{r, eval=T}
+# print first few rows election tallies data
+election %>% 
+  head(3) %>% 
+  pander()
+```
+</center>
+
+In order to clean the census data, we filtered out null values, converted the Men, Women, Employed, and Citizen variables into percentages of the total population, created a variable for minority by summing Hispanic, Black, Native, Asian, and Pacific, and removed variables irrelevant to building our models. We then weighted each of the numeric variables in the census data by population as a way to aggregate the data to the county level.
+
+```{r, include=FALSE}
+# clean census data
+census_clean = census %>% 
+  na.omit() %>% 
+  mutate(Men = (Men / TotalPop) * 100,
+         Women = (Women / TotalPop) * 100,
+         Employed = (Employed / TotalPop) * 100,
+         Citizen = (Citizen / TotalPop) * 100) %>% 
+  select(-Men) %>% 
+  mutate(Minority = Hispanic + Black + Native + Asian + Pacific) %>% 
+  select(-c(Hispanic, Black, Native, Asian, Pacific)) %>% 
+  select(-c(Income, Walk, PublicWork, Construction)) %>% 
+  select(-c(ends_with('Err')))
+
+# compute population-weighted quantitative variables
+census_clean_weighted = census_clean %>% 
+  group_by(State, County) %>% 
+  add_tally(TotalPop, name = 'CountyPop') %>% 
+  mutate(pop_wt = TotalPop / CountyPop) %>% 
+  mutate(across(where(is.numeric), ~ .x*pop_wt)) %>% 
+  ungroup() %>% 
+  select(-c(TotalPop, CountyPop, pop_wt))
+
+# aggregate to county level
+census_tidy = census_clean_weighted %>% 
+  select(-CensusTract) %>% 
+  group_by(State, County) %>% 
+  mutate(across(where(is.numeric), sum)) %>% 
+  ungroup() %>% 
+  unique()
+```
+
+<center>
+**Table 2: County-Level Census Data**
+
+The table below displays a tidied version of the census data that is aggregated to the county level in preparation to be merged with election tallies.
+```{r, eval=T}
+# print first few rows/columns
+census_tidy[1:3, 1:7] %>% 
+  pander()
+```
+</center>
+
+```{r}
+# clean up environment
+rm(list = setdiff(ls(), c("election_federal", "election_state", "election", "census_tidy")))
+```
+
+Once we were able to get the census data to the county level, we were finally able to merge this dataset with the county-level tallies election data. We finalized this dataset by selecting only the top two candidates in each county, and merging the two county level datasets. An example of the merged dataset is shown below.
+
+```{r, include=FALSE}
+# define function to coerce state abbreviations to names
+abb2name <- function(stateabb){
+  ix <- match(stateabb, state.abb)
+  out <- tolower(state.name[ix])
+  return(out)
+}
+
+# top two candidates by county
+toptwo <- election %>% 
+  group_by(fips) %>% 
+  mutate(total = sum(votes), 
+         pct = votes/total) %>% 
+  slice_max(pct, n = 2)
+
+# create temporary dataframes with matching state/county information
+tmpelection <- toptwo %>%
+  ungroup %>%
+  # coerce names to abbreviations
+  mutate(state = abb2name(state)) %>%
+  # everything lower case
+  mutate(across(c(state, county), tolower)) %>%
+  # remove county suffixes
+  mutate(county = gsub(" county| columbia| city| parish", 
+                       "", 
+                       county)) 
+tmpcensus <- census_tidy %>% 
+  # coerce state and county to lowercase
+  mutate(across(c(State, County), tolower))
+
+# merge
+merged_data <- tmpelection %>%
+  left_join(tmpcensus, 
+            by = c("state"="State", "county"="County")) %>% 
+  na.omit()
+
+# clear temporary dataframes from environment
+rm(list = c('tmpelection', 'tmpcensus'))
+```
+
+<center>
+**Table 3: Merged Data**
+
+The table below shows the top two candidates in each county by votes.  This also contains the demographic data related to each county.
+```{r, eval=TRUE}
+# print first few rows
+merged_data[1:6, 1:8] %>% pander()
+```
+</center>
+
+As seen, there are two rows for each county, one for each of the top two candidates with both containing demographic information related to the county.
+
+## Methods
+
+As stated before, the first task that we decided to tackle was predicting if the winner of each county was Donald Trump. In order to predict whether or not he won the popular vote for each county, we utilized both regression and classification methods.
+
+We began by building a linear regression model that predicted the percentage of votes Trump received out of the top two candidates. However, before we could do this, we needed to create a new variable for the total number of votes between the top two candidates and then calculate the percentage of votes that each of the top two candidates received based on that total. This was necessary as prediction would have been difficult due to the fact that there were votes for other candidates involved in the original vote percentage variable, meaning that there would be no precise cutoff point for determining who wins the county. By looking at the percentage of votes solely between the top two candidates, we can designate a cutoff point as it becomes evident that the candidate with more than 50% of the votes will have won in that county. Ultimately, this allowed us to narrow down our response variable to be the percentage of votes between the top two candidates. 
+
+After creating this new response variable, we filtered the data to only include “Donald Trump” rows. After creating this new variable, we split 20% of the dataset into a test dataset and the remaining 80% into a training dataset. The training would be used to build the model while the test would be used to test the accuracy of the model. We then built the linear regression model with this new percentage variable as the response variable and predictor variables as the rest of the demographic variables. By fitting the linear regression model, we were not only able to predict whether Trump won a county, but also observe which demographic variables were significant in doing so. In order to test the accuracy of the model, we both computed the test RMSE, and compared the number of counties he actually won versus the number of counties our model predicted him to win within the test dataset. 
+
+As for the classification methods, we started by filtering the original dataset to rows that only contained the winner of each county and then added the new response variable as a column of ‘Yes’ and ‘No’ levels to indicate if Trump won in that county. We then repartitioned this dataset into 20% and 80% for test and training datasets. This allowed us to build all our classification models using the training set and testing their accuracy on the test dataset. For the logistic regression, we once again used the demographic variables as predictors, and our new response variable as the dependent variable. With these settings, the goal of our classification models was to estimate a class label of ‘Yes’ or ‘No’ for each county. We then calculated the misclassification rates using both a 0.5 threshold in addition to an optimal threshold after plotting an ROC curve.  
+
+The next classification method we used was a random forest using the same response and predictor variables as the logistic regression. As for parameters for this model, we grew 100 trees and 5 variables at each split. We also looked at variable importance scores based on decreasing accuracy in order to determine which variables were most important in splitting the data for the trees. In order to test the accuracy of the random forest model, we calculated the misclassification rates on the test data. Moving on to the adaptive boosting method, we used the same response and predictor variables as before. We wanted to use this ensemble method to be able to look into observations that may be harder to predict, since boosting performs sequentially on the training data. We used 100 trees, an interaction depth of 3, and cross validated 5 times.  After finding the best number of trees, we calculated the misclassification rates on the test dataset.  
+
+The goal of using all these methods was to see which model would produce the lowest misclassification rate, thus allowing us to predict if Trump won a county with higher accuracy.
+
+Finally, in order to perform K-Means clustering, we centered and scaled the data, and then computed the first two principal components through singular value decomposition (SVD). Next, we plotted sums of squares (WSS) against a sequence of K to determine the best number of clusters to use. We plotted the two principal components on a scatter plot, colored by cluster, and shaped by whether or not they voted for Trump. Additionally, we visualized ridge plots for more interpretation on the relationship between the demographic variables and the clusters. 
+Finally, we computed the percentage of counties that voted for Trump in each cluster for further analysis. 
+
+# Results
+
+For our linear regression model, we aimed to predict Donald Trump’s vote percentage of the top two candidates for each county. After looking at a summary of the model, we were able to determine that all of the variables besides Women, White, Child Poverty, Other Transportation, and Family Work were statistically significant at a 0.05 threshold level in determining the response variable.  
+
+<center>
+**Table 4: Summary Table for Linear Model**
+
+The table below displays a summary of the linear regression model with the statistical significance of each of the demographic variables in terms of predicting the response.  Also shown is the adjusted $R^2$ as well as other summary statistics.
+```{r, eval=TRUE}
+# linear regression model
+votes_per_county = merged_data %>% 
+  group_by(fips) %>% 
+  summarize(sum(votes))
+
+merged_data_lm = merged_data %>% 
+  group_by(fips) %>% 
+  add_tally(votes) %>% #add column for total votes between top 2
+  mutate(pct_top2 = votes / n) %>% # column for pct votes between top 2
+  ungroup() %>% 
+  filter(candidate == "Donald Trump") %>% #filter to donald
+  select(c(Women:Minority, pct_top2)) #select columns we want for regression model
+
+set.seed(1089)
+merged_data_part = resample_partition(data = merged_data_lm, p = c(test = 0.2, train = 0.8))
+train = as.data.frame(merged_data_part$train)
+test = as.data.frame(merged_data_part$test)
+
+mod_lm = lm(pct_top2 ~ ., data = train)
+
+summary(mod_lm) %>% 
+  pander()
+```
+</center>
+
+```{r, include=FALSE}
+rmse(model = mod_lm, data = test) #small rmse
+
+# number of counties predicted to win
+as.tibble(predict(mod_lm, newdata = test)) %>% 
+  count(value > 0.5) %>% 
+  pander()
+
+# number of counties he actually won
+test %>% 
+  count(pct_top2 > 0.5) %>% 
+  pander() # predicted he won 21 more counties than he actually did
+```
+
+We also determined that the test root mean squared error (RMSE) for this model was about 0.091, which would suggest that the model accurately predicts the response. In addition, our adjusted $R^2$ is about 0.7 which means that the model is moderately strong in terms of fitting the data.
+In order to test our accuracy for this linear model, we looked at the number of counties we predicted Donald Trump to win in the test dataset, which is all the counties that we predicted to have a vote percentage above our cutoff of 50%. The number of counties that he won in this situation was 548 out of the 613 total counties in the test data (89.4%). We then compared this number to the actual number of counties he won out of the 613 counties in the test dataset. In actuality, Trump won 527 counties, which is around 86%. Conclusively, we predicted that he would win 21 more counties than he actually did, which means our model slightly overpredicted.
+
+We also did a logistic regression as a way to see how classification models would predict whether Donald Trump would win certain counties. After building the logistic regression model with a threshold of 0.5, we discovered that the true positive rate was slightly above 95% and the true negative rate was slightly above 66%. The total misclassification rate for this model was roughly 8.6%. After displaying an ROC curve, we determined that the optimal threshold was 0.926. When implementing this threshold into our model we got a much better true negative rate at 95%, but a lower true positive rate at 78.6%, and a higher total misclassification rate at 19.2%. As a result of this drastic increase in the total misclassification rate, we believe that it is better to simply use a threshold of 0.5. After performing the logistic regression, we decided to test out a random forest model as well as an adaboost model. After looking at the importance table for the random forest model, we determined that White, Minority, and Transit were the most important variables in terms of splitting the trees.  
+
+```{r, include=FALSE}
+# classification models: logistic regression
+merged_data_class = merged_data %>% 
+  group_by(fips) %>% 
+  slice_max(pct)
+
+merged_data_class$trump = ifelse(merged_data_class$candidate == "Donald Trump", "Yes", "No")
+merged_data_class$trump = as.factor(merged_data_class$trump)
+merged_data_class = merged_data_class %>% 
+  ungroup() %>% 
+  select(Women:trump)
+
+merged_data_part1 = resample_partition(data = merged_data_class, p = c(test = 0.2, train = 0.8))
+train1 = as.data.frame(merged_data_part1$train)
+test1 = as.data.frame(merged_data_part1$test)
+
+mod_glm = glm(trump ~ ., family = "binomial", data = train1)
+summary(mod_glm)
+
+p_hat_glm = predict(mod_glm, test1, type = 'response')
+
+y_hat_glm = factor(p_hat_glm > 0.5, labels = c("No", "Yes"))
+
+error_glm = table(test1$trump, y_hat_glm)
+error_glm / rowSums(error_glm)
+mean(test1$trump != y_hat_glm)
+
+# store training labels for use in constructing ROC
+predictions_glm = prediction(predictions = p_hat_glm,
+                             labels = test1$trump)
+# compute predictions and performance metrics
+perf_glm = performance(prediction.obj = predictions_glm, "tpr", "fpr")
+# convert tpr and fpr to data frame and calculate youden statistic
+rates_glm = tibble(fpr = perf_glm@x.values,
+                   tpr = perf_glm@y.values,
+                   thresh = perf_glm@alpha.values)
+rates_glm = rates_glm %>%
+  unnest() %>%
+  mutate(youden = tpr - fpr)
+# select optimal threshold
+optimal_thresh = rates_glm %>%
+  slice_max(youden)
+optimal_thresh
+
+#plot
+rates_glm %>%
+  ggplot(aes(x = fpr, y= tpr)) +
+  geom_line() +
+  geom_point(data = optimal_thresh, aes(x = fpr, y = tpr), color = "red", size = 2)
+
+y_hat_glm1 = factor(p_hat_glm > optimal_thresh$thresh, labels = c("No", "Yes"))
+
+error_glm1 = table(test1$trump, y_hat_glm1)
+error_glm1 / rowSums(error_glm1)
+mean(test1$trump != y_hat_glm1)
+
+# keep in mind that Trump won around 86% of the counties in the test data set meaning that
+# if we predicted that Trump on every single county, the total misclassification rate would be
+# around 14%
+
+test1 %>% 
+  count(trump == "Yes")
+```
+
+```{r, include=FALSE}
+# classification models: random forest
+fit_rf = randomForest(trump ~ ., data = train1, ntree = 100, mtry = 5, importance = T)
+summary(fit_rf)
+
+fit_rf
+```
+
+<center>
+**Table 5: Importance Table**
+
+The table below shows a list of the top 5 variables by decreasing accuracy as a way to show the most important variables in terms of splitting the trees.
+```{r, eval=TRUE}
+table = as.data.frame(fit_rf$importance) %>% 
+  arrange(-MeanDecreaseAccuracy)
+table[1:5,] %>% 
+  pander() 
+```
+</center>
+
+The true positive rate for the random forest model was 96.4%, the true negative rate was 63.7%, and the total misclassification rate was 7.8%. For the boosted model, we determined that the best number of iterations was 94 trees.
+
+```{r, include=FALSE}
+pred_rf = predict(fit_rf, test1, type = "class")
+
+error_test_rf = table(test1$trump, pred_rf)
+error_test_rf / rowSums(error_test_rf)
+mean(test1$trump != pred_rf)
+
+# boosting
+train1 = train1 %>% 
+  mutate(trump = as.numeric(trump) - 1)
+
+fit_gbm = gbm(trump ~ ., data = train1, n.trees = 100, interaction.depth = 3, distribution = 'adaboost', cv.folds = 5)
+
+fit_gbm
+```
+
+<center>
+**Figure 1: Best Number of Trees**
+
+Below shows a plot that displays the best number of trees for the adaptive boosting model.
+```{r, eval=TRUE, fig.height=3, fig.width=3}
+# select boosting iterations
+best_m = gbm.perf(fit_gbm, method = 'cv')
+```
+</center>
+
+```{r, include=FALSE}
+preds = predict(fit_gbm, test1, n.trees = best_m)
+probs = 1/(1 + exp(-preds))
+
+y_hat = factor(probs > 0.5, labels = c('No', 'Yes'))
+errors = table(test1$trump, pred = y_hat)
+errors / rowSums(errors)
+mean(test1$trump != y_hat)
+```
+
+The true positive rate for this model was 96.6%, the true negative rate was 61.2%, and the total misclassification rate was around 8%.
+
+Our next goal was to identify clusters within the data based on demographic variables using K-Means clustering. We chose the number of clusters, K, by plotting SSE and found an ‘elbow’ at 3 clusters. 
+
+```{r, include=FALSE}
+# PCA + K means clustering
+x_mx = merged_data_class %>% 
+  select(-c("trump")) %>% 
+  scale(center = T, scale = T)
+
+x_svd = svd(x_mx)
+
+v_svd = x_svd$v
+
+z_mx = x_mx %*% x_svd$v
+
+pc_vars <- x_svd$d^2/(nrow(x_mx) - 1)
+
+tibble(PC = 1:min(dim(x_mx)),
+Proportion = pc_vars/sum(pc_vars),
+Cumulative = cumsum(Proportion)) %>%
+gather(key = 'measure', value = 'Variance Explained', 2:3) %>%
+ggplot(aes(x = PC, y = `Variance Explained`)) +
+geom_point() +
+geom_path() +
+facet_wrap(~ measure) +
+theme_bw() +
+scale_x_continuous(breaks = 1:25, labels = as.character(1:25))
+
+# scatter plot of PCs based on yes or no
+z_mx[, 1:2] %>%
+as.data.frame() %>%
+rename(PC1 = V1, PC2 = V2) %>%
+bind_cols(select(merged_data_class, trump)) %>%
+ggplot(aes(x = PC1, y = PC2)) +
+geom_point(aes(color = trump), alpha = 0.5) +
+theme_bw()
+
+# k-means clustering
+kmeans_out = kmeans(x_mx, centers = 3, nstart = 5)
+clusters = factor(kmeans_out$cluster,
+                  labels = paste('cluster', 1:3))
+centers = kmeans_out$centers
+```
+
+<center>
+**Figure 2: WSS Plot**
+
+The plot below shows that there is an elbow at a k of 3 which implies that the best number of clusters to use for our K-Means clustering is 3.
+```{r, eval=T}
+k_seq = 2:20
+sse = sapply(k_seq, function(k){
+c(kmeans(x_mx,
+centers = k,
+nstart = 5,
+iter.max = 15)$tot.withinss,
+k = k)
+})
+
+sse = sse %>% 
+  t() %>% 
+  as_tibble()
+
+ggplot(data = sse, aes(x = k, y = V1)) +
+  geom_point() +
+  geom_path() +
+  theme_bw() #elbow at 3
+```
+</center>
+
+After performing K-Means clustering with 3 clusters and 5 random initializations, we plotted the first two principal components colored by cluster. 
+
+\newpage
+<center>
+**Figure 3: Scatterplot of the First Two Principal Components**
+
+The plot below shows the first two principal components colored by cluster and shaped by whether or not the county voted for Trump. 
+```{r, eval=TRUE}
+# clustered points
+z_mx[, 1:2] %>%
+as.data.frame() %>%
+rename(PC1 = V1, PC2 = V2) %>%
+  mutate(cluster = clusters) %>% 
+  bind_cols(select(merged_data_class, trump)) %>% 
+  ggplot(aes(x = PC1, y = PC2)) +
+  geom_point(aes(color = cluster, shape = trump)) +
+  theme_bw()
+```
+</center>
+
+In order to interpret this plot, we took a look at the ridge plot as a way to determine which variables were driving each cluster.
+
+\newpage
+<center>
+**Figure 4: Ridge Plots**
+
+Plot below shows how much each cluster is driven by the demographic variables in the model.  The variable distributions appear as multimodal mixtures. 
+```{r, eval=TRUE}
+# ridge plot
+as.data.frame(x_mx) %>%
+mutate(cluster = clusters) %>%
+gather(key = variable, value = value, 1:22) %>%
+ggplot(aes(y = variable, x = value)) +
+geom_density_ridges(aes(fill = cluster),
+bandwidth = 0.2,
+alpha = 0.5) +
+theme_minimal() +
+xlim(c(-3, 3)) +
+labs(y = '')
+```
+</center>
+
+A quick look at the ridge plots indicated that Cluster 1 was mainly influenced by high values of WorkAtHome, White, Professional, IncomePerCap, Employed, and low values of Unemployment, Production, Poverty, and ChildPoverty. This seems to mainly describe a white, middle-upper class population. Cluster 2 was mainly driven by high values of White, PrivateWork, and Drive, and low values of Poverty, ChildPoverty, and Minority. This seems to point at a primarily white community. Cluster 3 was affected by high values of Unemployment, Service, Poverty, Minority, ChildPoverty, and low values for WorkAtHome, White, Professional, IncomePerCap and Employment. This describes a lower class population with more diversity. In order to interpret the clusters in relation to Trump’s likelihood to win, we looked at the percentage of counties that Trump won per cluster. Cluster 1 yielded 78.52%, Cluster 2 yielded 96%, and Cluster 3 yielded 68.89%. It appears that Cluster 1 and 2 had the highest percentage of counties that voted for Trump, which were both clusters driven by high white populations and high income per capita as seen above. Conversely, Cluster 3 had the lowest percentage of votes for Trump and was driven by a high minority population and low income per capita. 
+
+```{r, include=FALSE}
+merged_data_class %>% 
+  mutate(cluster = clusters) %>% 
+  filter(cluster == "cluster 1") %>% 
+  count(trump == "Yes")
+
+(691 / (691 + 189)) * 100
+
+merged_data_class %>% 
+  mutate(cluster = clusters) %>% 
+  filter(cluster == "cluster 2") %>% 
+  count(trump == "Yes")
+
+(1439 / (1439 + 60)) * 100
+
+merged_data_class %>% 
+  mutate(cluster = clusters) %>% 
+  filter(cluster == "cluster 3") %>% 
+  count(trump == "Yes")
+
+(476 / (476 + 215)) * 100
+```
+
+
+# Discussion
+
+In the end, we discovered that the highest accuracy came from the random forest model as we were able to predict with about 92.2% accuracy on whether or not Trump would win a specific county. The boosted model came close with an accuracy of about 92%, while the logistic regression with a threshold of 0.5 ended up slightly behind with an accuracy of about 91.4%. When using the optimal threshold for the logistic regression, we found that the true negative rate increased but the total misclassification rate jumped to about 19%. One observation we made while interpreting the results is that Trump won around 87% of the counties in the test data, which would imply that if the misclassification rate in a model was above 13%, there would be no improvement in using a model to predict election results in comparison to simply stating that he won every county. 
+
+An issue that we ran into while fitting the linear regression model was that there was one county that did not have Donald Trump as one of the top two candidates. We addressed this by excluding that county from the model. 
+
+As for the K-Means clustering, we were able to cluster our unstructured data and see if there were any distinct groups driven by the demographic variables. We discovered that the top two clusters that had the highest percentage of counties vote for Trump, were also predominantly white and wealthy. One the other hand, the cluster with the lowest percentage of counties that voted for Trump was driven by a higher population of minorities and lower income.
+
+As mentioned in our introduction, there are many potential factors that make election forecasting a difficult task, especially due to the fact that some human behavior is not easily predictable through a model. Thus, we believe that the task of predicting the election may be significantly easier after having the results of the election compared to using polling data prior to the election. However, we were ultimately able to discover patterns in the data that we would not have noticed without knowing the election results. Hopefully, we will be able to build more accurate predictive models that adjust to the difficulties of using polling data in the future. 
+
+# Appendix
+```{r appendix, ref.label=knitr::all_labels(), echo=TRUE, eval=FALSE}
+```
+
+<center>
+```{r, echo=FALSE}
+library(icon)
+fa("globe", size = 5, color="green")
+```
+</center>
+
+<div class="tocify-extend-page" data-unique="tocify-extend-page" style="height: 0;"></div>
