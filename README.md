@@ -1,1 +1,5 @@
-# 2016Election
+## Predicting the 2016 Presidential Election Based on Demographic Data
+This project aimed to take a look at the 2016 Presidential Election, mainly focusing on the effects of demographic variables on election results per county in the U.S. Election. We explored various models to answer whether or not Donald Trump would win a county based on demographic variables such as unemployment, poverty, income per capita, and 19 others. With these models, we sought to perform both regression and classification methods. With respect to the regression method, we utilized a linear regression that served to predict the percentage of votes between the top two candidates that Donald Trump received by county. As for the classification methods, we used a logistic regression, random forest, and an adaptive boosting model to predict a class of “Yes” or “No”, referring to whether or not Trump won that specific county.  
+
+Our last goal was to identify patterns among counties sharing certain demographic characteristics and see if there was a way to interpret these patterns with the election results. Through K-Means clustering we were able to find a few distinct groupings, and examined whether or not these could help identify if counties with certain demographics would vote for Trump or not. 
+
